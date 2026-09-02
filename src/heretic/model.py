@@ -603,6 +603,8 @@ class Model:
                             ).to(torch.float32),
                         )
 
+                    matrix = torch.nn.Parameter(matrix)
+
                     row_norms = LA.vector_norm(matrix, dim=1, keepdim=True).detach()
 
                     # Helper function for reparameterization (row-norm preservation constraint).
