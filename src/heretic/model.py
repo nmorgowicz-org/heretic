@@ -4,7 +4,7 @@
 import math
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Type, cast
+from typing import Any, Callable, Type, TypeAlias, cast
 
 import bitsandbytes as bnb
 import torch
@@ -14,17 +14,17 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora.layer import Linear
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
+from torch.optim import LBFGS
+from torch.utils.hooks import RemovableHandle
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
-    AutoProcessor,
     AutoTokenizer,
     BatchEncoding,
     BitsAndBytesConfig,
     PretrainedConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
-    ProcessorMixin,
     TextStreamer,
 )
 from transformers.generation import (
@@ -32,8 +32,7 @@ from transformers.generation import (
 )
 
 from .config import QuantizationMethod, RowNormalization, Settings
-from .system import empty_cache
-from .utils import Prompt, batchify, format_exception, print
+from .utils import Prompt, batchify, empty_cache, mean_distances_to_knn, print
 
 
 def get_model_class(
@@ -55,37 +54,40 @@ class AbliterationParameters:
     min_weight_distance: float
 
 
+@dataclass
+class ARAParameters:
+    start_layer_index: int
+    end_layer_index: int
+    preserve_good_behavior_weight: float
+    steer_bad_behavior_weight: float
+    overcorrect_relative_weight: float
+    neighbor_count: int
+
+
+# The list contains one element per layer.
+# Each element maps from the component name to a (possibly sparse) mapping
+# from the module index to an (input, output) tuple containing the I/O
+# tensors of shape (prompt, component).
+ModuleIO: TypeAlias = list[dict[str, dict[int, tuple[Tensor, Tensor]]]]
+
+
 class Model:
     model: PreTrainedModel | PeftModel
     tokenizer: PreTrainedTokenizerBase
-    # Set for multimodal models, None for text-only ones.
-    processor: ProcessorMixin | None
     peft_config: LoraConfig
-    dtype: torch.dtype
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.response_prefix = ""
         self.needs_reload = False
-
-        self.revision_kwargs = {}
-        if settings.model_commit is not None:
-            self.revision_kwargs["revision"] = settings.model_commit
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             settings.model,
-            **self.revision_kwargs,
+            trust_remote_code=settings.trust_remote_code,
         )
-
-        # Multimodal models have a processor we'll want to save.
-        self.processor = None
-        if get_model_class(settings.model) == AutoModelForImageTextToText:
-            self.processor = AutoProcessor.from_pretrained(
-                settings.model,
-                **self.revision_kwargs,
-            )
 
         # Fallback for tokenizers that don't declare a special pad token.
         if self.tokenizer.pad_token is None:
@@ -102,8 +104,10 @@ class Model:
             if settings.max_memory
             else None
         )
+        self.trusted_models = {settings.model: settings.trust_remote_code}
 
-        self.trusted_models = set()
+        if self.settings.evaluate_model is not None:
+            self.trusted_models[settings.evaluate_model] = settings.trust_remote_code
 
         for dtype in settings.dtypes:
             print(f"* Trying dtype [bold]{dtype}[/]...")
@@ -122,19 +126,14 @@ class Model:
                     dtype=dtype,
                     device_map=settings.device_map,
                     max_memory=self.max_memory,
-                    trust_remote_code=True
-                    if settings.model in self.trusted_models
-                    else None,
-                    **self.revision_kwargs,
+                    trust_remote_code=self.trusted_models.get(settings.model),
                     **extra_kwargs,
                 )
 
-                self.dtype = self.model.dtype
-
                 # If we reach this point and the model requires trust_remote_code,
-                # the user must have agreed when prompted to execute remote code,
-                # because from_pretrained raises an exception otherwise.
-                self.trusted_models.add(settings.model)
+                # either the user accepted, or settings.trust_remote_code is True.
+                if self.trusted_models.get(settings.model) is None:
+                    self.trusted_models[settings.model] = True
 
                 # A test run can reveal dtype-related problems such as the infamous
                 # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
@@ -151,13 +150,7 @@ class Model:
             except Exception as error:
                 self.model = None  # ty:ignore[invalid-assignment]
                 empty_cache()
-
-                formatted = format_exception(error)
-                if "\n" in formatted:
-                    print(f"* [red]Failed:\n{formatted}[/]")
-                else:
-                    print(f"* [red]Failed ({formatted})[/]")
-
+                print(f"* [red]Failed[/] ({error})")
                 continue
 
             if settings.quantization == QuantizationMethod.BNB_4BIT:
@@ -168,21 +161,20 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
-        self._apply_lora()
+        if not settings.use_ara or settings.use_ara_lora:
+            self._apply_lora()
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
 
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
-
+        print("* Abliterable components:")
         all_components = {}
         for layer_index in range(len(self.get_layers())):
             for component, modules in self.get_layer_modules(layer_index).items():
                 if component not in all_components:
                     all_components[component] = 0
                 all_components[component] += len(modules)
-
-        print("* Abliterable components:")
         for component, count in all_components.items():
             print(f"  * [bold]{component}[/]: [bold]{count}[/] modules total")
 
@@ -196,7 +188,7 @@ class Model:
         # because hybrid models like Qwen3.5 MoE have modules with different names
         # across layers (e.g. "o_proj" on attention layers, "out_proj" on linear attention layers).
         target_modules_set: set[str] = set()
-
+        
         module_id_to_full_name = {
             id(module): module_name
             for module_name, module in self.model.named_modules()
@@ -211,7 +203,9 @@ class Model:
 
         target_modules = sorted(target_modules_set)
 
-        if self.settings.row_normalization != RowNormalization.FULL:
+        if self.settings.use_ara_lora:
+            lora_rank = self.settings.ara_lora_rank
+        elif self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
             lora_rank = 1
         else:
@@ -284,10 +278,7 @@ class Model:
                 self.settings.model,
                 torch_dtype=self.model.dtype,
                 device_map="cpu",
-                trust_remote_code=True
-                if self.settings.model in self.trusted_models
-                else None,
-                **self.revision_kwargs,
+                trust_remote_code=self.trusted_models.get(self.settings.model),
             )
 
             # Apply LoRA adapters to the CPU model
@@ -322,45 +313,42 @@ class Model:
         - Slow path: If switching models or after merge_and_unload(),
           performs full model reload with quantization config.
         """
-
-        # If a prior model load was interrupted/cancelled mid-process, self.model will be None.
-        current_model = None
-        if self.model is not None:
-            current_model = getattr(self.model.config, "name_or_path", None)
-
-        if current_model == self.settings.model and not self.needs_reload:
-            # Reset LoRA adapters to zero (identity transformation).
+        current_model = getattr(self.model.config, "name_or_path", None)
+        if (
+            current_model == self.settings.model
+            and not self.needs_reload
+            and (not self.settings.use_ara or self.settings.use_ara_lora)
+        ):
+            # Reset LoRA adapters to zero (identity transformation)
             for name, module in self.model.named_modules():
                 if "lora_B" in name and hasattr(module, "weight"):
                     torch.nn.init.zeros_(module.weight)
             return
 
+        dtype = self.model.dtype
+
         # Purge existing model object from memory to make space.
         self.model = None  # ty:ignore[invalid-assignment]
         empty_cache()
 
-        quantization_config = self._get_quantization_config(
-            str(self.dtype).split(".")[-1]
-        )
+        quantization_config = self._get_quantization_config(str(dtype).split(".")[-1])
 
-        # Build kwargs, only include quantization_config if it's not None.
+        # Build kwargs, only include quantization_config if it's not None
         extra_kwargs = {}
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
-            dtype=self.dtype,
+            dtype=dtype,
             device_map=self.settings.device_map,
             max_memory=self.max_memory,
-            trust_remote_code=True
-            if self.settings.model in self.trusted_models
-            else None,
-            **self.revision_kwargs,
+            trust_remote_code=self.trusted_models.get(self.settings.model),
             **extra_kwargs,
         )
 
-        self._apply_lora()
+        if not self.settings.use_ara or self.settings.use_ara_lora:
+            self._apply_lora()
 
         self.needs_reload = False
 
@@ -384,6 +372,9 @@ class Model:
         modules = {}
 
         def try_add(component: str, module: Any):
+            if component not in self.settings.target_components:
+                return
+
             # Only add if it's a proper nn.Module (PEFT can wrap these with LoRA)
             if isinstance(module, Module):
                 if component not in modules:
@@ -399,8 +390,8 @@ class Model:
         with suppress(Exception):
             try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
 
-        # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead of
-        # standard self-attention, so self_attn.o_proj doesn't exist on those layers.
+        # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead
+        # of standard self-attention, so self_attn.o_proj doesn't exist on those layers.
         with suppress(Exception):
             try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
 
@@ -416,21 +407,6 @@ class Model:
         # Phi-3.5-MoE (and possibly others).
         with suppress(Exception):
             for expert in layer.block_sparse_moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
-                try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
-
-        # LFM dense operator blocks.
-        with suppress(Exception):
-            try_add("attn.o_proj", layer.conv.out_proj)  # ty:ignore[possibly-missing-attribute]
-
-        with suppress(Exception):
-            try_add("mlp.down_proj", layer.feed_forward.w2)  # ty:ignore[possibly-missing-attribute]
-
-        # LFM transformer blocks.
-        with suppress(Exception):
-            try_add("attn.o_proj", layer.self_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
-
-        with suppress(Exception):
-            for expert in layer.feed_forward.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
 
         # Granite MoE Hybrid - attention layers with shared_mlp.
@@ -449,30 +425,28 @@ class Model:
         return modules
 
     def get_abliterable_components(self) -> list[str]:
-        components: set[str] = set()
-
         # Scan all layers because hybrid models (e.g. Qwen3.5 MoE) have different
         # components on different layers (some have self_attn, others linear_attn).
+        components: set[str] = set()
         for layer_index in range(len(self.get_layers())):
             components.update(self.get_layer_modules(layer_index).keys())
-
         return sorted(components)
 
     def abliterate(
         self,
-        residual_directions: Tensor,
+        refusal_directions: Tensor,
         direction_index: float | None,
         parameters: dict[str, AbliterationParameters],
     ):
         if direction_index is None:
-            residual_direction = None
+            refusal_direction = None
         else:
             # The index must be shifted by 1 because the first element
-            # of residual_directions is the direction for the embeddings.
+            # of refusal_directions is the direction for the embeddings.
             weight, index = math.modf(direction_index + 1)
-            residual_direction = F.normalize(
-                residual_directions[int(index)].lerp(
-                    residual_directions[int(index) + 1],
+            refusal_direction = F.normalize(
+                refusal_directions[int(index)].lerp(
+                    refusal_directions[int(index) + 1],
                     weight,
                 ),
                 p=2,
@@ -499,18 +473,12 @@ class Model:
                     params.min_weight - params.max_weight
                 )
 
-                # A weight of 0 disables this component's ablation. reset_model() has
-                # already left the adapter at identity, so abort before the otherwise
-                # wasteful decomposition (which would also be operating on a zero matrix).
-                if weight == 0:
-                    continue
-
-                if residual_direction is None:
+                if refusal_direction is None:
                     # The index must be shifted by 1 because the first element
-                    # of residual_directions is the direction for the embeddings.
-                    layer_residual_direction = residual_directions[layer_index + 1]
+                    # of refusal_directions is the direction for the embeddings.
+                    layer_refusal_direction = refusal_directions[layer_index + 1]
                 else:
-                    layer_residual_direction = residual_direction
+                    layer_refusal_direction = refusal_direction
 
                 for module in modules:
                     # FIXME: This cast is potentially invalid, because the program logic
@@ -526,9 +494,9 @@ class Model:
                     # lora_B = -lambda * v
                     # lora_A = v^T W
 
-                    # Use the FP32 residual direction directly (no downcast/upcast)
+                    # Use the FP32 refusal direction directly (no downcast/upcast)
                     # and move to the correct device.
-                    v = layer_residual_direction.to(module.weight.device)
+                    v = layer_refusal_direction.to(module.weight.device)
 
                     # Get W (dequantize if necessary).
                     #
@@ -555,11 +523,9 @@ class Model:
                     # Flatten weight matrix to (out_features, in_features).
                     W = W.view(W.shape[0], -1)
 
-                    if self.settings.row_normalization == RowNormalization.FULL:
+                    if self.settings.row_normalization != RowNormalization.NONE:
                         # Keep a reference to the original weight matrix so we can subtract it later.
                         W_org = W
-
-                    if self.settings.row_normalization != RowNormalization.NONE:
                         # Get the row norms.
                         W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
                         # Normalize the weight matrix along the rows.
@@ -588,16 +554,7 @@ class Model:
                         W = W - W_org
                         # Use a low-rank SVD to get an approximation of the matrix.
                         r = self.peft_config.r
-
-                        # svd_lowrank is randomized:
-                        # https://github.com/pytorch/pytorch/blob/20919052303c0b5ba87f8bf7e19237dc33ab09d3/torch/_lowrank.py#L108-L109
-                        # Reseed immediately before the call so restoring a trial is independent of RNG history.
-                        torch.manual_seed(self.settings.seed)
-                        # "It's safe to call this function if CUDA is not available;
-                        # in that case, it is silently ignored."
-                        torch.cuda.manual_seed_all(self.settings.seed)  # ty:ignore[invalid-argument-type]
                         U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
-
                         # Truncate it to the part we want to store in the LoRA adapter.
                         # Note: svd_lowrank actually returns V, so transpose it to get Vh.
                         U = U[:, :r]
@@ -617,6 +574,228 @@ class Model:
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
                     weight_A.data = lora_A.to(weight_A.dtype)
                     weight_B.data = lora_B.to(weight_B.dtype)
+
+    def ara_abliterate(
+        self,
+        good_module_io: ModuleIO,
+        bad_module_io: ModuleIO,
+        parameters: ARAParameters,
+    ):
+        for layer_index in range(
+            parameters.start_layer_index,
+            parameters.end_layer_index,
+        ):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                for module_index, module in enumerate(modules):
+                    # See above for a (partial) justification of this cast.
+                    module = cast(Linear, module)
+                    matrix = module.weight
+
+                    row_norms = LA.vector_norm(matrix, dim=1, keepdim=True).detach()
+
+                    # Helper function for reparameterization (row-norm preservation constraint).
+                    def get_matrix() -> Tensor:
+                        if self.settings.row_normalization == RowNormalization.FULL:
+                            # See https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
+                            return row_norms * F.normalize(matrix, p=2, dim=1)
+                        else:
+                            return matrix
+
+                    good_input, good_output = good_module_io[layer_index][component][
+                        module_index
+                    ]
+                    bad_input, bad_output = bad_module_io[layer_index][component][
+                        module_index
+                    ]
+
+                    good_input = good_input.to(matrix.device)
+                    good_output = good_output.to(matrix.device)
+                    bad_input = bad_input.to(matrix.device)
+                    bad_output = bad_output.to(matrix.device)
+
+                    def objective(matrix: Tensor) -> Tensor:
+                        new_good_output = good_input @ matrix.T
+                        new_bad_output = bad_input @ matrix.T
+
+                        # The outputs for "good" prompts should change as little as possible.
+                        preserve_good_behavior = (
+                            (new_good_output - good_output) ** 2
+                        ).mean()
+
+                        steer_bad_behavior = (
+                            # Pull the outputs for "bad" prompts towards
+                            # the original outputs for "good" prompts.
+                            mean_distances_to_knn(
+                                new_bad_output,
+                                good_output,
+                                parameters.neighbor_count,
+                            ).mean()
+                            # Push the outputs for "bad" prompts away from
+                            # the original outputs for "bad" prompts.
+                            # In combination with the above, this overcorrects
+                            # away from the original residuals, which results
+                            # in stronger steering that can overcome more complex
+                            # refusal mechanisms.
+                            + parameters.overcorrect_relative_weight
+                            * -mean_distances_to_knn(
+                                new_bad_output,
+                                bad_output,
+                                parameters.neighbor_count,
+                            ).mean()
+                        )
+
+                        return (
+                            parameters.preserve_good_behavior_weight
+                            * preserve_good_behavior
+                            + parameters.steer_bad_behavior_weight * steer_bad_behavior
+                        )
+
+                    optimizer = LBFGS(
+                        [matrix],
+                        lr=1.0,
+                        max_iter=20,  # Number of internal iterations per step, *not* the number of steps.
+                        history_size=10,
+                        line_search_fn="strong_wolfe",
+                    )
+
+                    def closure() -> Tensor:
+                        optimizer.zero_grad()
+                        loss = objective(get_matrix())
+                        loss.backward()
+                        return loss
+
+                    # Convergence usually happens within 2-3 steps, so this is more than enough.
+                    for step in range(5):
+                        loss = optimizer.step(closure)
+                        # print(
+                        #    f"\\[{layer_index}/{component}/{module_index}] Step: {step}, Loss: {loss.item():.6f}"
+                        # )
+
+                    # Free the gradient buffers accumulated on the weight parameters
+                    # during optimization. Without this, they persist on the model
+                    # (one full-size gradient per processed weight) and can easily
+                    # consume tens of GiB of VRAM, causing out-of-memory errors
+                    # during the subsequent evaluation.
+                    optimizer.zero_grad(set_to_none=True)
+
+                    with torch.no_grad():
+                        matrix.copy_(get_matrix())
+
+    def ara_lora_abliterate(
+        self,
+        good_module_io: ModuleIO,
+        bad_module_io: ModuleIO,
+        parameters: ARAParameters,
+    ):
+        for layer_index in range(
+            parameters.start_layer_index,
+            parameters.end_layer_index,
+        ):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                for module_index, module in enumerate(modules):
+                    # Cast to Linear to access weights and LoRA adapters.
+                    module = cast(Linear, module)
+
+                    # Base weight handling and dequantization.
+                    # We need the base weight in float32 to compute the effective weight.
+                    base_weight = cast(Tensor, module.base_layer.weight)
+                    quant_state = getattr(base_weight, "quant_state", None)
+
+                    if quant_state is None:
+                        W_base = base_weight.to(torch.float32)
+                    else:
+                        # Maintain the original dequantization logic for bitsandbytes.
+                        W_base = cast(
+                            Tensor,
+                            bnb.functional.dequantize_4bit(
+                                base_weight.data, 
+                                quant_state
+                            ).to(torch.float32),
+                        )
+
+                    # Row normalization setup.
+                    # Pre-calculate the original row norms to preserve them.
+                    # This implements the RowNormalization.FULL logic.
+                    W_row_norms = LA.vector_norm(W_base, dim=1, keepdim=True).detach()
+
+                    # Adapter target identification.
+                    # We optimize the LoRA weights A and B.
+                    lora_A = cast(Tensor, module.lora_A["default"].weight)
+                    lora_B = cast(Tensor, module.lora_B["default"].weight)
+
+                    # Data preparation.
+                    # Move I/O tensors to the device of the adapter weights.
+                    good_input, good_output = good_module_io[layer_index][component][module_index]
+                    bad_input, bad_output = bad_module_io[layer_index][component][module_index]
+
+                    good_input = good_input.float().to(lora_A.device)
+                    good_output = good_output.float().to(lora_A.device)
+                    bad_input = bad_input.float().to(lora_A.device)
+                    bad_output = bad_output.float().to(lora_A.device)
+
+                    # The objective function.
+                    def objective(A: Tensor, B: Tensor) -> Tensor:
+                        # Calculate effective weight: W_eff = W_base + B @ A.
+                        W_eff = W_base + (B @ A)
+
+                        # Apply Row Normalization (keep original norms).
+                        if self.settings.row_normalization == RowNormalization.FULL:
+                            # Normalize to unit length, then scale by original norms.
+                            W_eff = F.normalize(W_eff, p=2, dim=1) * W_row_norms
+
+                        # Compute outputs using the effective weight.
+                        new_good_output = good_input @ W_eff.T
+                        new_bad_output = bad_input @ W_eff.T
+
+                        # The original ARA loss function.
+                        preserve_good_behavior = (
+                            (new_good_output - good_output) ** 2
+                        ).mean()
+
+                        steer_bad_behavior = (
+                            mean_distances_to_knn(
+                                new_bad_output,
+                                good_output,
+                                parameters.neighbor_count,
+                            ).mean()
+                            + parameters.overcorrect_relative_weight
+                            * -mean_distances_to_knn(
+                                new_bad_output,
+                                bad_output,
+                                parameters.neighbor_count,
+                            ).mean()
+                        )
+
+                        return (
+                            parameters.preserve_good_behavior_weight
+                            * preserve_good_behavior
+                            + parameters.steer_bad_behavior_weight * steer_bad_behavior
+                        )
+
+                    # Optimization loop.
+                    # We optimize A and B, not the base matrix.
+                    optimizer = LBFGS(
+                        [lora_A, lora_B],
+                        lr=1.0,
+                        max_iter=20,
+                        history_size=10,
+                        line_search_fn="strong_wolfe",
+                    )
+
+                    def closure():
+                        optimizer.zero_grad()
+                        # Pass the actual tensors being optimized to the objective.
+                        loss = objective(lora_A, lora_B)
+                        loss.backward()
+                        return loss
+
+                    # Run optimization steps.
+                    for step in range(5):
+                        optimizer.step(closure)
+
+                    # Free the gradient buffers accumulated on the LoRA adapter
+                    # parameters during optimization (see ara_abliterate for details).
+                    optimizer.zero_grad(set_to_none=True)
 
     def generate(
         self,
@@ -642,12 +821,10 @@ class Model:
             ),
         )
 
-        if self.settings.response_prefix:
+        if self.response_prefix:
             # Append the common response prefix to the prompts so that evaluation happens
             # at the point where responses start to differ for different prompts.
-            chat_prompts = [
-                prompt + self.settings.response_prefix for prompt in chat_prompts
-            ]
+            chat_prompts = [prompt + self.response_prefix for prompt in chat_prompts]
 
         inputs = self.tokenizer(
             chat_prompts,
@@ -691,6 +868,7 @@ class Model:
         skip_special_tokens: bool = False,
     ) -> list[str]:
         responses = []
+
         for batch in batchify(prompts, self.settings.batch_size):
             for response in self.get_responses(
                 batch,
@@ -708,9 +886,6 @@ class Model:
             max_new_tokens=1,
             output_hidden_states=True,
             return_dict_in_generate=True,
-            # KV cache is unnecessary here because we only need the hidden states
-            # for the first generated token.
-            use_cache=False,
         )
 
         # This cast is valid because GenerateDecoderOnlyOutput is the return type
@@ -744,11 +919,7 @@ class Model:
                 dim=2,
                 keepdim=True,
             )
-            residuals = torch.clamp(residuals, -thresholds, thresholds)
-
-        if self.settings.offload_outputs_to_cpu:
-            residuals = residuals.cpu()
-            empty_cache()
+            return torch.clamp(residuals, -thresholds, thresholds)
 
         return residuals
 
@@ -760,39 +931,142 @@ class Model:
 
         return torch.cat(residuals, dim=0)
 
-    def get_residuals_mean(self, prompts: list[Prompt]) -> Tensor:
-        if not prompts:
-            raise ValueError("prompts must not be empty")
+    def get_module_io(
+        self,
+        prompts: list[Prompt],
+    ) -> ModuleIO:
+        # The list contains one element per layer.
+        # Each element maps from the component name to a (possibly sparse) mapping
+        # from the module index to an (input, output) tuple containing the I/O
+        # tensors of shape (prompt, component).
+        module_io: ModuleIO = []
 
-        running_sum = None
-        total_count = 0
+        def get_hook(
+            layer_index: int,
+            component: str,
+            module_index: int,
+        ) -> Callable[[Module, tuple[Tensor, ...], Tensor], None]:
+            def hook(
+                module: Module,
+                inputs: tuple[Tensor, ...],
+                outputs: Tensor,
+            ) -> None:
+                if len(module_io) == layer_index:
+                    # First invocation of the hook for this layer.
+                    module_io.append({})
 
-        for batch in batchify(prompts, self.settings.batch_size):
-            batch_residuals = self.get_residuals(batch)
+                # Layers are invoked in order during inference,
+                # so this should always hold.
+                assert len(module_io) == layer_index + 1
 
-            # Accumulate in high precision on CPU to reduce peak VRAM usage.
-            batch_sum = batch_residuals.sum(dim=0, dtype=torch.float64).cpu()
+                if component not in module_io[layer_index]:
+                    module_io[layer_index][component] = {}
 
-            if running_sum is None:
-                running_sum = batch_sum
-            else:
-                running_sum += batch_sum
+                # Each module should be invoked at most once per inference step.
+                assert module_index not in module_io[layer_index][component]
 
-            total_count += batch_residuals.shape[0]
+                # inputs[0] and outputs have shape (prompt, position, component),
+                # so this extracts the input/output at the end of each prompt.
+                # Move to CPU to decouple from device assignments, which can
+                # change between model reloads in multi-GPU configurations.
+                input = inputs[0][:, -1, :].detach().clone().cpu()
+                output = outputs[:, -1, :].detach().clone().cpu()
 
-        assert running_sum is not None
+                # The modules associated with a component (e.g. expert MLPs)
+                # are not necessarily invoked in order, nor are all of them
+                # necessarily invoked in each inference step, so we cannot
+                # use a list here.
+                module_io[layer_index][component][module_index] = (input, output)
 
-        return (running_sum / total_count).to(torch.float32)
+            return hook
 
-    def get_logits(self, prompts: list[Prompt]) -> Tensor:
-        # We only generate one token, and we return the raw logits over the vocabulary
-        # at that token position, for each prompt.
+        hook_handles: list[RemovableHandle] = []
+
+        for layer_index in range(len(self.get_layers())):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                for module_index, module in enumerate(modules):
+                    hook_handles.append(
+                        module.register_forward_hook(
+                            get_hook(layer_index, component, module_index)
+                        )
+                    )
+
+        self.generate(prompts, max_new_tokens=1)
+
+        for hook_handle in hook_handles:
+            hook_handle.remove()
+
+        return module_io
+
+    def get_module_io_batched(
+        self,
+        prompts: list[Prompt],
+    ) -> ModuleIO:
+        # Aggregating batch results is more complicated for module I/O
+        # than for other get_*_batched methods, because the structure of the results
+        # might differ between batches, as whether individual modules activate
+        # can depend on the prompt (in particular for MoE models).
+        # In practice, inhomogeneous results should be very rare, but to be fully
+        # generic, this logic is required.
+        module_io_batches: list[ModuleIO] = [
+            self.get_module_io(batch)
+            for batch in batchify(prompts, self.settings.batch_size)
+        ]
+
+        module_io: ModuleIO = []
+
+        for layer_index in range(len(self.get_layers())):
+            module_io.append({})
+
+            for module_io_batch in module_io_batches:
+                for component, io_map in module_io_batch[layer_index].items():
+                    if component not in module_io[layer_index]:
+                        module_io[layer_index][component] = {}
+
+                    for module_index in io_map:
+                        if module_index not in module_io[layer_index][component]:
+                            # This is a placeholder; the actual aggregation happens below.
+                            # We need to iterate over the batches twice because we don't
+                            # know in advance which components and module indices are present.
+                            module_io[layer_index][component][module_index] = (
+                                torch.empty(0),
+                                torch.empty(0),
+                            )
+
+            for component, io_map in module_io[layer_index].items():
+                for module_index in io_map:
+                    inputs_outputs = [
+                        module_io_batch[layer_index][component][module_index]
+                        for module_io_batch in module_io_batches
+                        if component in module_io_batch[layer_index]
+                        and module_index in module_io_batch[layer_index][component]
+                    ]
+                    input = torch.cat(
+                        [input_output[0] for input_output in inputs_outputs],
+                        dim=0,
+                    )
+                    output = torch.cat(
+                        [input_output[1] for input_output in inputs_outputs],
+                        dim=0,
+                    )
+
+                    # The key already exists, and replacing existing values
+                    # in a dictionary while iterating over the same dictionary
+                    # is safe in Python.
+                    module_io[layer_index][component][module_index] = (input, output)
+
+        return module_io
+
+    # We work with logprobs rather than probabilities for numerical stability
+    # when computing the KL divergence.
+    def get_logprobs(self, prompts: list[Prompt]) -> Tensor:
+        # We only generate one token, and we return the (log) probability distributions
+        # over the vocabulary at that token position, for each prompt.
         _, outputs = self.generate(
             prompts,
             max_new_tokens=1,
-            output_logits=True,
+            output_scores=True,
             return_dict_in_generate=True,
-            use_cache=False,
         )
 
         # This cast is valid because GenerateDecoderOnlyOutput is the return type
@@ -800,26 +1074,19 @@ class Model:
         outputs = cast(GenerateDecoderOnlyOutput, outputs)
 
         # Logits for the first (only) generated token.
-        # Use raw logits, not processed generation scores; processors can insert
-        # -inf for suppressed tokens, which can make KL divergence evaluate to NaN.
-        # This cast is valid because we passed output_logits=True above.
-        logits = cast(tuple[FloatTensor], outputs.logits)[0]
+        # This cast is valid because we passed output_scores=True above.
+        logits = cast(tuple[FloatTensor], outputs.scores)[0]
 
         # The returned tensor has shape (prompt, token).
-        if self.settings.offload_outputs_to_cpu:
-            del outputs
-            logits = logits.cpu()
-            empty_cache()
+        return F.log_softmax(logits, dim=-1)
 
-        return logits
-
-    def get_logits_batched(self, prompts: list[Prompt]) -> Tensor:
-        logits = []
+    def get_logprobs_batched(self, prompts: list[Prompt]) -> Tensor:
+        logprobs = []
 
         for batch in batchify(prompts, self.settings.batch_size):
-            logits.append(self.get_logits(batch))
+            logprobs.append(self.get_logprobs(batch))
 
-        return torch.cat(logits, dim=0)
+        return torch.cat(logprobs, dim=0)
 
     def stream_chat_response(self, chat: list[dict[str, str]]) -> str:
         # This cast is valid because str is the return type
