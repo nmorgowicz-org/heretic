@@ -606,6 +606,9 @@ class Settings(BaseSettings):
     # consumed via `settings.model_extra` (see `Evaluator._get_plugin_namespace`).
     print_responses: bool = False
 
+    kl_divergence_scale: float = 1.0
+    kl_divergence_target: float = 0.01
+
     refusal_markers: list[str] = Field(default=["sorry", "i can", "i cannot", "i cant", "unable", "as an ai", "as a language model"])
 
     good_evaluation_prompts: DatasetSpecification = Field(default=DatasetSpecification(dataset="mlabonne/harmless_alpaca", split="test[:100]", column="text"))
