@@ -620,10 +620,10 @@ class Model:
                         module_index
                     ]
 
-                    good_input = good_input.to(matrix.device)
-                    good_output = good_output.to(matrix.device)
-                    bad_input = bad_input.to(matrix.device)
-                    bad_output = bad_output.to(matrix.device)
+                    good_input = good_input.to(device=matrix.device, dtype=matrix.dtype)
+                    good_output = good_output.to(device=matrix.device, dtype=matrix.dtype)
+                    bad_input = bad_input.to(device=matrix.device, dtype=matrix.dtype)
+                    bad_output = bad_output.to(device=matrix.device, dtype=matrix.dtype)
 
                     def objective(matrix: Tensor) -> Tensor:
                         new_good_output = good_input @ matrix.T
