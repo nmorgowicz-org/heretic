@@ -503,7 +503,8 @@ class Model:
                     # FIXME: This cast is valid only under the assumption that the original
                     #        module wrapped by the LoRA adapter has a weight attribute.
                     #        See the comment above for why this is currently not guaranteed.
-                    base_weight = cast(Tensor, module.base_layer.weight)
+                    base_module = getattr(module, "base_layer", module)
+                    base_weight = cast(Tensor, base_module.weight)
                     quant_state = getattr(base_weight, "quant_state", None)
 
                     if quant_state is None:
@@ -589,7 +590,8 @@ class Model:
                 for module_index, module in enumerate(modules):
                     # See above for a (partial) justification of this cast.
                     module = cast(Linear, module)
-                    base_weight = cast(Tensor, module.base_layer.weight)
+                    base_module = getattr(module, "base_layer", module)
+                    base_weight = cast(Tensor, base_module.weight)
                     quant_state = getattr(base_weight, "quant_state", None)
                     if quant_state is None:
                         matrix = base_weight.to(torch.float32)
@@ -708,7 +710,8 @@ class Model:
 
                     # Base weight handling and dequantization.
                     # We need the base weight in float32 to compute the effective weight.
-                    base_weight = cast(Tensor, module.base_layer.weight)
+                    base_module = getattr(module, "base_layer", module)
+                    base_weight = cast(Tensor, base_module.weight)
                     quant_state = getattr(base_weight, "quant_state", None)
 
                     if quant_state is None:
