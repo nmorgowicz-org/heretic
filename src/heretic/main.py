@@ -504,16 +504,26 @@ def run():
         trial.set_user_attr("index", trial_index)
 
         if settings.use_ara:
-            start_layer_index = trial.suggest_int(
-                "start_layer_index",
-                0,
-                len(model.get_layers()) // 2,
+            start_layer_index = (
+                settings.ara_start_layer_index
+                if settings.ara_start_layer_index is not None
+                else trial.suggest_int(
+                    "start_layer_index",
+                    0,
+                    len(model.get_layers()) // 2,
+                )
             )
-            end_layer_index = trial.suggest_int(
-                "end_layer_index",
-                len(model.get_layers()) // 2,
-                len(model.get_layers()),
+            end_layer_index = (
+                settings.ara_end_layer_index
+                if settings.ara_end_layer_index is not None
+                else trial.suggest_int(
+                    "end_layer_index",
+                    len(model.get_layers()) // 2,
+                    len(model.get_layers()),
+                )
             )
+            trial.set_user_attr("start_layer_index", start_layer_index)
+            trial.set_user_attr("end_layer_index", end_layer_index)
             preserve_good_behavior_weight = trial.suggest_float(
                 "preserve_good_behavior_weight",
                 0.0,

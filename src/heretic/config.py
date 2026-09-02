@@ -369,6 +369,9 @@ class Settings(BaseSettings):
         ),
     )
     
+    ara_start_layer_index: int | None = Field(default=None, description="Optional fixed ARA start layer.")
+    ara_end_layer_index: int | None = Field(default=None, description="Optional fixed ARA end layer.")
+
     use_ara_lora: bool = Field(
         default=False,
         description=(
