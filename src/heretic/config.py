@@ -155,6 +155,7 @@ class BenchmarkSpecification(BaseModel):
 
 
 class Settings(BaseSettings):
+    trust_remote_code: bool = False
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
     model_commit: str | None = Field(
