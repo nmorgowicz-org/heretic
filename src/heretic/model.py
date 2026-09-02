@@ -136,7 +136,8 @@ class Model:
                     self.trusted_models[settings.model] = True
 
                 # A test run can reveal dtype-related problems such as the infamous
-                # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
+                # "RuntimeError: probability tensor contains either `inf`, 
+an` or element < 0"
                 # (https://github.com/meta-llama/llama/issues/380).
                 self.generate(
                     [
@@ -589,7 +590,12 @@ class Model:
                 for module_index, module in enumerate(modules):
                     # See above for a (partial) justification of this cast.
                     module = cast(Linear, module)
-                    matrix = module.weight
+                    base_weight = cast(Tensor, module.base_layer.weight)
+                    quant_state = getattr(base_weight, "quant_state", None)
+                    if quant_state is None:
+                        matrix = base_weight.to(torch.float32)
+                    else:
+                        matrix = cast(Tensor, bnb.functional.dequantize_4bit(base_weight.data, quant_state).to(torch.float32))
 
                     row_norms = LA.vector_norm(matrix, dim=1, keepdim=True).detach()
 
