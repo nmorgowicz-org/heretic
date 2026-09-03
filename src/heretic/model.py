@@ -393,7 +393,7 @@ class Model:
         # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead
         # of standard self-attention, so self_attn.o_proj doesn't exist on those layers.
         with suppress(Exception):
-            try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
+            try_add("attn.out_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Most dense models.
         with suppress(Exception):
@@ -693,7 +693,55 @@ class Model:
                     optimizer.zero_grad(set_to_none=True)
 
                     with torch.no_grad():
-                        matrix.copy_(get_matrix())
+                        adjusted_matrix = get_matrix()
+
+                        # Install the optimized shadow matrix into the live
+                        # module. A BNB4 weight is packed, so it must be
+                        # re-quantized rather than assigned as a dense tensor.
+                        if quant_state is None:
+                            base_weight.data.copy_(
+                                adjusted_matrix.to(
+                                    device=base_weight.device,
+                                    dtype=base_weight.dtype,
+                                )
+                            )
+                        else:
+                            quantized_weight, adjusted_quant_state = (
+                                bnb.functional.quantize_4bit(
+                                    adjusted_matrix.to(
+                                        device=base_weight.device,
+                                        dtype=torch.float32,
+                                    ),
+                                    blocksize=getattr(quant_state, "blocksize", 64),
+                                    compress_statistics=getattr(
+                                        quant_state, "nested", False
+                                    ),
+                                    quant_type=getattr(
+                                        quant_state, "quant_type", "nf4"
+                                    ),
+                                    quant_storage=getattr(
+                                        quant_state,
+                                        "quant_storage",
+                                        getattr(
+                                            base_weight,
+                                            "quant_storage",
+                                            torch.uint8,
+                                        ),
+                                    ),
+                                )
+                            )
+                            base_module.weight = bnb.nn.Params4bit.from_prequantized(
+                                data=quantized_weight,
+                                quantized_stats=adjusted_quant_state.as_dict(packed=True),
+                                requires_grad=False,
+                                device=base_weight.device,
+                            )
+
+                        # Release dense optimizer and quantization temporaries.
+                        if quant_state is not None:
+                            del quantized_weight, adjusted_quant_state
+                        del adjusted_matrix, optimizer, closure, matrix
+                        empty_cache()
 
     def ara_lora_abliterate(
         self,

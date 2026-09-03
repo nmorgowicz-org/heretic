@@ -354,10 +354,10 @@ class Settings(BaseSettings):
     )
 
     target_components: list[str] = Field(
-        default=["attn.o_proj", "mlp.down_proj"],
+        default=["attn.o_proj", "attn.out_proj", "mlp.down_proj"],
         description=(
             "List of component names to target for abliteration. "
-            'Currently supported values are "attn.o_proj" and "mlp.down_proj".'
+            'Currently supported values are "attn.o_proj", "attn.out_proj", and "mlp.down_proj".'
         ),
     )
 
