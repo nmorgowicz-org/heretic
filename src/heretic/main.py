@@ -12,6 +12,7 @@ patch_tqdm()
 import logging
 import math
 import os
+import random
 import sys
 import time
 import warnings
@@ -185,6 +186,13 @@ def run():
             "Run [bold]heretic --help[/] or see [bold]config.default.toml[/] for details about configuration parameters."
         )
         return
+
+    # Make the configured seed effective for all stochastic components used by
+    # Heretic. When unset, choose one once and retain it in checkpointed
+    # settings so a resumed run keeps the same seed.
+    if settings.seed is None:
+        settings.seed = random.SystemRandom().randint(0, 2**32 - 1)
+    transformers.set_seed(settings.seed)
 
     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
     if torch.cuda.is_available():
@@ -503,6 +511,12 @@ def run():
         trial_index += 1
         trial.set_user_attr("index", trial_index)
 
+        # torch.svd_lowrank, used by ARA, is randomized. Reset the RNG for
+        # each trial so a trial's result does not depend on prior trials.
+        trial_seed = (settings.seed + trial.number) % (2**32)
+        transformers.set_seed(trial_seed)
+        trial.set_user_attr("seed", trial_seed)
+
         if settings.use_ara:
             start_layer_index = (
                 settings.ara_start_layer_index
@@ -684,6 +698,7 @@ def run():
             n_startup_trials=settings.n_startup_trials,
             n_ei_candidates=128,
             multivariate=True,
+            seed=settings.seed,
         ),
         directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
         storage=storage,
