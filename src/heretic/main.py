@@ -592,6 +592,12 @@ def run():
         trial_index += 1
         trial.set_user_attr("index", trial_index)
 
+        # torch.svd_lowrank, used by ARA, is randomized. Reset the RNG for
+        # each trial so a trial's result does not depend on prior trials.
+        trial_seed = (settings.seed + trial.number) % (2**32)
+        transformers.set_seed(trial_seed)
+        trial.set_user_attr("seed", trial_seed)
+
         direction_scope = trial.suggest_categorical(
             "direction_scope",
             [
