@@ -72,7 +72,7 @@ from rich.traceback import install
 from .analyzer import Analyzer
 from .config import ExportStrategy, QuantizationMethod
 from .evaluator import Evaluator
-from .model import AbliterationParameters, Model, get_model_class
+from .model import ARAParameters, AbliterationParameters, Model, get_model_class
 from .reproduce import (
     check_environment,
     collect_reproducibles,
@@ -533,55 +533,58 @@ def run():
         )
         return
 
-    print()
-    print("Calculating per-layer residual directions...")
-
-    needs_full_residuals = settings.print_residual_geometry or settings.plot_residuals
-
-    if needs_full_residuals:
-        print("* Obtaining residuals for good prompts...")
-        good_residuals = model.get_residuals_batched(good_prompts)
-        print("* Obtaining residuals for bad prompts...")
-        bad_residuals = model.get_residuals_batched(bad_prompts)
-
-        good_means = good_residuals.mean(dim=0)
-        bad_means = bad_residuals.mean(dim=0)
-
-        analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
-
-        if settings.print_residual_geometry:
-            analyzer.print_residual_geometry()
-
-        if settings.plot_residuals:
-            analyzer.plot_residuals()
-
-        # We don't need the full residuals after computing their means and analyzing geometry.
-        del good_residuals, bad_residuals, analyzer
+    if settings.use_ara:
+        # ARA optimizes selected weight matrices directly from captured module I/O.
+        # Raw BNB4 modules intentionally have no lora_A/lora_B attributes.
+        print()
+        print("Obtaining module I/O for good prompts...")
+        good_module_io = model.get_module_io_batched(good_prompts)
+        print("Obtaining module I/O for bad prompts...")
+        bad_module_io = model.get_module_io_batched(bad_prompts)
+        empty_cache()
     else:
-        print("* Obtaining residual mean for good prompts...")
-        good_means = model.get_residuals_mean(good_prompts)
-        print("* Obtaining residual mean for bad prompts...")
-        bad_means = model.get_residuals_mean(bad_prompts)
+        print()
+        print("Calculating per-layer residual directions...")
 
-    residual_directions = F.normalize(bad_means - good_means, p=2, dim=1)
+        needs_full_residuals = settings.print_residual_geometry or settings.plot_residuals
 
-    if settings.orthogonalize_direction:
-        # Implements https://huggingface.co/blog/grimjim/projected-abliteration
-        # Adjust the residual directions so that only the component that is
-        # orthogonal to the good direction is subtracted during abliteration.
-        good_directions = F.normalize(good_means, p=2, dim=1)
-        projection_vector = torch.sum(residual_directions * good_directions, dim=1)
-        residual_directions = (
-            residual_directions - projection_vector.unsqueeze(1) * good_directions
-        )
-        residual_directions = F.normalize(residual_directions, p=2, dim=1)
-        del good_directions, projection_vector
+        if needs_full_residuals:
+            print("* Obtaining residuals for good prompts...")
+            good_residuals = model.get_residuals_batched(good_prompts)
+            print("* Obtaining residuals for bad prompts...")
+            bad_residuals = model.get_residuals_batched(bad_prompts)
 
-    del good_means, bad_means
+            good_means = good_residuals.mean(dim=0)
+            bad_means = bad_residuals.mean(dim=0)
 
-    # Clear cache before starting the optimization study.
-    # This should free up memory from the objects released with the del statements above.
-    empty_cache()
+            analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
+
+            if settings.print_residual_geometry:
+                analyzer.print_residual_geometry()
+
+            if settings.plot_residuals:
+                analyzer.plot_residuals()
+
+            del good_residuals, bad_residuals, analyzer
+        else:
+            print("* Obtaining residual mean for good prompts...")
+            good_means = model.get_residuals_mean(good_prompts)
+            print("* Obtaining residual mean for bad prompts...")
+            bad_means = model.get_residuals_mean(bad_prompts)
+
+        residual_directions = F.normalize(bad_means - good_means, p=2, dim=1)
+
+        if settings.orthogonalize_direction:
+            good_directions = F.normalize(good_means, p=2, dim=1)
+            projection_vector = torch.sum(residual_directions * good_directions, dim=1)
+            residual_directions = (
+                residual_directions - projection_vector.unsqueeze(1) * good_directions
+            )
+            residual_directions = F.normalize(residual_directions, p=2, dim=1)
+            del good_directions, projection_vector
+
+        del good_means, bad_means
+        empty_cache()
 
     trial_index = 0
     start_index = 0
@@ -598,83 +601,77 @@ def run():
         transformers.set_seed(trial_seed)
         trial.set_user_attr("seed", trial_seed)
 
-        direction_scope = trial.suggest_categorical(
-            "direction_scope",
-            [
-                "global",
-                "per layer",
-            ],
-        )
-
-        last_layer_index = len(model.get_layers()) - 1
-
-        # Discrimination between "harmful" and "harmless" inputs is usually strongest
-        # in layers slightly past the midpoint of the layer stack. See the original
-        # abliteration paper (https://arxiv.org/abs/2406.11717) for a deeper analysis.
-        #
-        # Note that we always sample this parameter even though we only need it for
-        # the "global" direction scope. The reason is that multivariate TPE doesn't
-        # work with conditional or variable-range parameters.
-        direction_index = trial.suggest_float(
-            "direction_index",
-            0.4 * last_layer_index,
-            0.9 * last_layer_index,
-        )
-
-        if direction_scope == "per layer":
-            direction_index = None
-
-        parameters = {}
-
-        for component in model.get_abliterable_components():
-            # The parameter ranges are based on experiments with various models
-            # and much wider ranges. They are not set in stone and might have to be
-            # adjusted for future models.
-            #
-            # The MLP gets a negative lower bound that is then clamped to 0, so the
-            # optimizer can fully disable its ablation. The clamp puts a positive
-            # probability mass on exactly 0 (the continuous sampler would otherwise
-            # reach 0 with probability zero). Ablating the MLP is often unnecessary for
-            # removing refusals and tends to damage model intelligence more than
-            # ablating the attention output, so on many models the optimum is to leave
-            # it (mostly) untouched. See issue #202.
-            max_weight_lower_bound = -0.25 if component == "mlp.down_proj" else 0.8
-            max_weight = max(
-                0.0,
-                trial.suggest_float(
-                    f"{component}.max_weight",
-                    max_weight_lower_bound,
-                    1.5,
+        if settings.use_ara:
+            layer_count = len(model.get_layers())
+            fixed_start = settings.ara_start_layer_index
+            fixed_end = settings.ara_end_layer_index
+            start_layer_index = trial.suggest_int(
+                "start_layer_index",
+                fixed_start if fixed_start is not None else 0,
+                fixed_start if fixed_start is not None else layer_count // 2,
+            )
+            end_layer_index = trial.suggest_int(
+                "end_layer_index",
+                fixed_end if fixed_end is not None else layer_count // 2,
+                fixed_end if fixed_end is not None else layer_count,
+            )
+            ara_parameters = ARAParameters(
+                start_layer_index=start_layer_index,
+                end_layer_index=end_layer_index,
+                preserve_good_behavior_weight=trial.suggest_float(
+                    "preserve_good_behavior_weight", 0.0, 1.0
                 ),
+                steer_bad_behavior_weight=trial.suggest_float(
+                    "steer_bad_behavior_weight", 0.0001, 1.0, log=True
+                ),
+                overcorrect_relative_weight=trial.suggest_float(
+                    "overcorrect_relative_weight", 0.0, 1.3
+                ),
+                neighbor_count=trial.suggest_int("neighbor_count", 1, 15),
             )
-            max_weight_position = trial.suggest_float(
-                f"{component}.max_weight_position",
-                0.6 * last_layer_index,
-                1.0 * last_layer_index,
-            )
-            # For sampling purposes, min_weight is expressed as a fraction of max_weight,
-            # again because multivariate TPE doesn't support variable-range parameters.
-            # The value is transformed into the actual min_weight value below.
-            min_weight = trial.suggest_float(
-                f"{component}.min_weight",
-                0.0,
-                1.0,
-            )
-            min_weight_distance = trial.suggest_float(
-                f"{component}.min_weight_distance",
-                1.0,
-                max(0.6 * last_layer_index, 1.0),
+            trial.set_user_attr("ara_parameters", asdict(ara_parameters))
+        else:
+            direction_scope = trial.suggest_categorical(
+                "direction_scope", ["global", "per layer"]
             )
 
-            parameters[component] = AbliterationParameters(
-                max_weight=max_weight,
-                max_weight_position=max_weight_position,
-                min_weight=(min_weight * max_weight),
-                min_weight_distance=min_weight_distance,
+            last_layer_index = len(model.get_layers()) - 1
+            direction_index = trial.suggest_float(
+                "direction_index", 0.4 * last_layer_index, 0.9 * last_layer_index
             )
+            if direction_scope == "per layer":
+                direction_index = None
 
-        trial.set_user_attr("direction_index", direction_index)
-        trial.set_user_attr("parameters", {k: asdict(v) for k, v in parameters.items()})
+            parameters = {}
+
+            for component in model.get_abliterable_components():
+                max_weight_lower_bound = -0.25 if component == "mlp.down_proj" else 0.8
+                max_weight = max(
+                    0.0,
+                    trial.suggest_float(
+                        f"{component}.max_weight", max_weight_lower_bound, 1.5
+                    ),
+                )
+                max_weight_position = trial.suggest_float(
+                    f"{component}.max_weight_position",
+                    0.6 * last_layer_index,
+                    1.0 * last_layer_index,
+                )
+                min_weight = trial.suggest_float(f"{component}.min_weight", 0.0, 1.0)
+                min_weight_distance = trial.suggest_float(
+                    f"{component}.min_weight_distance",
+                    1.0,
+                    max(0.6 * last_layer_index, 1.0),
+                )
+                parameters[component] = AbliterationParameters(
+                    max_weight=max_weight,
+                    max_weight_position=max_weight_position,
+                    min_weight=min_weight * max_weight,
+                    min_weight_distance=min_weight_distance,
+                )
+
+            trial.set_user_attr("direction_index", direction_index)
+            trial.set_user_attr("parameters", {k: asdict(v) for k, v in parameters.items()})
 
         print()
         print(
@@ -683,10 +680,25 @@ def run():
         print("* Parameters:")
         for name, value in get_trial_parameters(trial).items():
             print(f"  * {name} = [bold]{value}[/]")
-        print("* Resetting model...")
-        model.reset_model()
-        print("* Abliterating...")
-        model.abliterate(residual_directions, direction_index, parameters)
+        if settings.use_ara_lora:
+            print("* Resetting model...")
+            model.reset_model()
+            print("* Abliterating (Arbitrary-Rank Ablation with LoRA)...")
+            model.ara_lora_abliterate(
+                good_module_io,
+                bad_module_io,
+                ARAParameters(**trial.user_attrs["ara_parameters"]),
+            )
+        elif settings.use_ara:
+            print("* Reloading model...")
+            model.reset_model()
+            print("* Abliterating (Arbitrary-Rank Ablation)...")
+            model.ara_abliterate(good_module_io, bad_module_io, ara_parameters)
+        else:
+            print("* Resetting model...")
+            model.reset_model()
+            print("* Abliterating...")
+            model.abliterate(residual_directions, direction_index, parameters)
         print("* Evaluating...")
         scores = evaluator.get_scores()
         objective_values = evaluator.get_objective_values(scores)
@@ -923,17 +935,36 @@ def run():
             # once a LoRA is merged it's expected to be empty. Provide a utility function
             # to restore the previous LoRA-ified state.
             def reset_trial_model():
-                print("* Resetting model...")
-                model.reset_model()
-                print("* Abliterating...")
-                model.abliterate(
-                    residual_directions,
-                    trial.user_attrs["direction_index"],
-                    {
-                        k: AbliterationParameters(**v)
-                        for k, v in trial.user_attrs["parameters"].items()
-                    },
-                )
+                if settings.use_ara_lora:
+                    print("* Resetting model...")
+                    model.reset_model()
+                    print("* Abliterating (Arbitrary-Rank Ablation with LoRA)...")
+                    model.ara_lora_abliterate(
+                        good_module_io,
+                        bad_module_io,
+                        ARAParameters(**trial.user_attrs["ara_parameters"]),
+                    )
+                elif settings.use_ara:
+                    print("* Reloading model...")
+                    model.reset_model()
+                    print("* Abliterating (Arbitrary-Rank Ablation)...")
+                    model.ara_abliterate(
+                        good_module_io,
+                        bad_module_io,
+                        ARAParameters(**trial.user_attrs["ara_parameters"]),
+                    )
+                else:
+                    print("* Resetting model...")
+                    model.reset_model()
+                    print("* Abliterating...")
+                    model.abliterate(
+                        residual_directions,
+                        trial.user_attrs["direction_index"],
+                        {
+                            k: AbliterationParameters(**v)
+                            for k, v in trial.user_attrs["parameters"].items()
+                        },
+                    )
 
             reset_trial_model()
 
