@@ -284,8 +284,10 @@ def run():
             f"torch.get_num_interop_threads() = [bold]{torch.get_num_interop_threads()}[/]"
         )
 
-    # We don't need gradients as we only do inference.
-    torch.set_grad_enabled(False)
+    # Traditional directional ablation only needs inference. ARA optimizes
+    # matrices with LBFGS, so it must keep autograd enabled.
+    if not settings.use_ara:
+        torch.set_grad_enabled(False)
 
     # While determining the optimal batch size, we will try many different batch sizes,
     # resulting in many computation graphs being compiled. Raising the limit (default = 8)
