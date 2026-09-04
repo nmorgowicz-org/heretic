@@ -1120,6 +1120,40 @@ class Model:
 
         return module_io
 
+    def get_logits(self, prompts: list[Prompt]) -> Tensor:
+        # Generate exactly one token and return the raw logits at that position.
+        # The plugin-era KL scorer expects raw logits rather than log probabilities.
+        # Using output_logits avoids generation processors inserting -inf values,
+        # which can otherwise produce NaNs in KL divergence.
+        _, outputs = self.generate(
+            prompts,
+            max_new_tokens=1,
+            output_logits=True,
+            return_dict_in_generate=True,
+            use_cache=False,
+        )
+
+        outputs = cast(GenerateDecoderOnlyOutput, outputs)
+        logits = cast(tuple[FloatTensor], outputs.logits)[0]
+
+        # Keep the analysis tensor off the GPU when configured. This is important
+        # for the 32 GB card: both the baseline and candidate logits must use the
+        # same device for KL scoring, so the scorer will keep both on CPU.
+        if self.settings.offload_outputs_to_cpu:
+            del outputs
+            logits = logits.cpu()
+            empty_cache()
+
+        return logits
+
+    def get_logits_batched(self, prompts: list[Prompt]) -> Tensor:
+        logits = []
+
+        for batch in batchify(prompts, self.settings.batch_size):
+            logits.append(self.get_logits(batch))
+
+        return torch.cat(logits, dim=0)
+
     # We work with logprobs rather than probabilities for numerical stability
     # when computing the KL divergence.
     def get_logprobs(self, prompts: list[Prompt]) -> Tensor:
