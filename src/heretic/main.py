@@ -389,14 +389,17 @@ def run():
         if settings.checkpoint_action is None:
             print()
 
-        action = ask_if_unset(
-            settings.checkpoint_action,
-            questionary.select(
-                "How would you like to proceed?",
-                choices=choices,
-                style=Style([("highlighted", "reverse")]),
-            ),
-        )
+        if settings.checkpoint_action is None:
+            action = ask_if_unset(
+                None,
+                questionary.select(
+                    "How would you like to proceed?",
+                    choices=choices,
+                    style=Style([("highlighted", "reverse")]),
+                ),
+            )
+        else:
+            action = settings.checkpoint_action
 
         if action is None or action == "":
             return
@@ -871,16 +874,25 @@ def run():
                 if settings.trial_index is None:
                     print()
 
-                trial = ask_if_unset(
-                    None
-                    if settings.trial_index is None
-                    else sorted_trials[settings.trial_index],
-                    questionary.select(
-                        "Which trial do you want to use?",
-                        choices=choices,
-                        style=Style([("highlighted", "reverse")]),
-                    ),
-                )
+                if settings.trial_index is not None:
+                    trial = sorted_trials[settings.trial_index]
+                elif not sys.stdout.isatty():
+                    print(
+                        "Optimization finished. A terminal is required to select a trial interactively."
+                    )
+                    print(
+                        "Rerun with --trial-index=<index> to select a Pareto trial non-interactively."
+                    )
+                    return
+                else:
+                    trial = ask_if_unset(
+                        None,
+                        questionary.select(
+                            "Which trial do you want to use?",
+                            choices=choices,
+                            style=Style([("highlighted", "reverse")]),
+                        ),
+                    )
 
                 if trial is None or trial == "":
                     return
@@ -979,6 +991,12 @@ def run():
 
                 if settings.model_action is None:
                     print()
+
+                if settings.model_action is None and not sys.stdout.isatty():
+                    print(
+                        "No interactive console is available for the model action menu; exiting."
+                    )
+                    return
 
                 action = ask_if_unset(
                     settings.model_action,
