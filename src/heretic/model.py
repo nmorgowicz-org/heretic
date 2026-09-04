@@ -929,15 +929,20 @@ class Model:
         self,
         prompts: list[Prompt],
         skip_special_tokens: bool = False,
+        batch_size: int | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> list[str]:
         responses = []
 
-        for batch in batchify(prompts, self.settings.batch_size):
+        batches = list(batchify(prompts, batch_size or self.settings.batch_size))
+        for batch_index, batch in enumerate(batches, 1):
             for response in self.get_responses(
                 batch,
                 skip_special_tokens=skip_special_tokens,
             ):
                 responses.append(response)
+            if progress_callback is not None:
+                progress_callback(batch_index, len(batches))
 
         return responses
 
@@ -1085,6 +1090,8 @@ class Model:
     def get_module_io_batched(
         self,
         prompts: list[Prompt],
+        batch_size: int | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> ModuleIO:
         # Aggregating batch results is more complicated for module I/O
         # than for other get_*_batched methods, because the structure of the results
@@ -1092,10 +1099,12 @@ class Model:
         # can depend on the prompt (in particular for MoE models).
         # In practice, inhomogeneous results should be very rare, but to be fully
         # generic, this logic is required.
-        module_io_batches: list[ModuleIO] = [
-            self.get_module_io(batch)
-            for batch in batchify(prompts, self.settings.batch_size)
-        ]
+        batches = list(batchify(prompts, batch_size or self.settings.batch_size))
+        module_io_batches: list[ModuleIO] = []
+        for batch_index, batch in enumerate(batches, 1):
+            module_io_batches.append(self.get_module_io(batch))
+            if progress_callback is not None:
+                progress_callback(batch_index, len(batches))
 
         module_io: ModuleIO = []
 
