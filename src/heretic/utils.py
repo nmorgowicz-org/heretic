@@ -279,6 +279,14 @@ def empty_cache():
 
 
 def get_trial_parameters(trial: Trial | FrozenTrial) -> dict[str, str]:
+    # ARA trials store their complete parameter set separately from the
+    # traditional directional-ablation parameters.
+    if "ara_parameters" in trial.user_attrs:
+        return {
+            name: (f"{value:.4f}" if isinstance(value, float) else str(value))
+            for name, value in trial.user_attrs["ara_parameters"].items()
+        }
+
     params = {}
 
     direction_index = trial.user_attrs["direction_index"]
