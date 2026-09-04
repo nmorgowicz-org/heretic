@@ -22,6 +22,7 @@ from datasets.config import DATASET_STATE_JSON_FILENAME
 from datasets.download.download_manager import DownloadMode
 from datasets.utils.info_utils import VerificationMode
 from optuna import Trial
+from optuna.study import StudyDirection
 from psutil import Process
 from questionary import Choice, Style
 from rich.console import Console
@@ -30,6 +31,24 @@ from torch import Tensor
 from .config import DatasetSpecification, RowNormalization, Settings
 
 print = Console(highlight=False).print
+
+
+def deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge dictionaries, with override values taking precedence."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def parse_study_direction(optimization: str) -> StudyDirection:
+    """Convert a scorer optimization name to Optuna's direction enum."""
+    if optimization == "none":
+        return StudyDirection.NOT_SET
+    return StudyDirection[optimization.upper()]
 
 
 def print_memory_usage():
