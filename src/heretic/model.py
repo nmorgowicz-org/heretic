@@ -994,6 +994,27 @@ class Model:
 
         return torch.cat(residuals, dim=0)
 
+    def get_residuals_mean(self, prompts: list[Prompt]) -> Tensor:
+        if not prompts:
+            raise ValueError("prompts must not be empty")
+
+        running_sum = None
+        total_count = 0
+
+        for batch in batchify(prompts, self.settings.batch_size):
+            batch_residuals = self.get_residuals(batch)
+            batch_sum = batch_residuals.sum(dim=0, dtype=torch.float64).cpu()
+
+            if running_sum is None:
+                running_sum = batch_sum
+            else:
+                running_sum += batch_sum
+
+            total_count += batch_residuals.shape[0]
+
+        assert running_sum is not None
+        return (running_sum / total_count).to(torch.float32)
+
     def get_module_io(
         self,
         prompts: list[Prompt],
